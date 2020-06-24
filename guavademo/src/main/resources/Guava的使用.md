@@ -157,7 +157,7 @@ public static List<Employee> createEmployeeListOnJdk8() {
 或：
 
 ```java
-public static List<Employee> createEmployeeListOnJdk83() {
+public static List<Employee> createEmployeeListOnJdk8() {
     return new ArrayList<Employee>() {
         {
             add(new Employee(1, 20, "John"));
@@ -409,6 +409,12 @@ public class EvenBusMain {
 
 
 
+### 源码分析
+
+
+
+
+
 ## Guava Cache
 
 Guava Cache与ConcurrentMap很相似，但也不完全一样。最基本的区别是ConcurrentMap会一直保存所有添加的元素，直到显式地移除。相对地，Guava Cache为了限制内存占用，通常都设定为自动回收元素。在某些场景下，尽管LoadingCache 不回收元素，它也是很有用的，因为它会自动加载缓存。
@@ -432,7 +438,6 @@ public class CacheMain {
     }
 }
 ```
-
 
 
 ### 设置过期时间
@@ -554,6 +559,53 @@ public class CacheMain {
 
 Cache接口提供了invalidateAll或invalidate方法显式删除Cache中的记录。invalidate方法接收一个参数Key，invalidateAll方法无参数时清除所有记录，传入Iterable类型参数时删除参数中包含的所有Key对应的记录。
 
+```java
+/** Discards any cached value for key {@code key}. */
+void invalidate(@CompatibleWith("K") Object key);
+
+/**
+ * Discards any cached values for keys {@code keys}.
+ *
+ * @since 11.0
+ */
+void invalidateAll(Iterable<?> keys);
+
+/** Discards all entries in the cache. */
+void invalidateAll();
+```
+
+### 加载
+
+所谓加载就是在获取key时如果没有值就进行值的加载，加载完成后返回。LoadingCache附带CacheLoader构建而成的缓存实现，创建自己的CacheLoader通常
+
+```java
+public static void main(String[] args) throws ExecutionException {
+    LoadingCache<String, Object> cache = CacheBuilder.newBuilder().build(new CacheLoader<String, Object>() {
+        @Override
+        public Object load(String key) throws Exception {
+            return generateValueFromKey(key);
+        }
+
+        private String generateValueFromKey(String key) {
+            String value = key + ":" + UUID.randomUUID().toString();
+            System.out.println("Generate value from key, value=" + value);
+            return value;
+        }
+    });
+
+    cache.put("hello", "world");
+    System.out.println(cache.get("hello"));
+    System.out.println(cache.get("hello2"));
+    System.out.println(cache.get("hello2"));
+}
+```
+
+运行结果如下：
+
+![image-20200623174230089](Guava的使用.assets/image-20200623174230089.png)
+
+仅当key不存在时根据key进行对应的加载，并放入缓存中返回。
+
 ### 设置移除监听器
 
 可以设置Cache记录被移除时触发的移除监听器，在记录被删除时执行一些操作。
@@ -574,6 +626,22 @@ Cache<String, Object> cache = CacheBuilder.newBuilder()
                 // 设置移除监听器
                 .removalListener(listener)
                 .build();
+```
+
+上面的移除监听器是同步执行的，如果想要异步执行，可以使用异步的移除监听器，传入自定义的线程池，RemovalListeners.asynchronous()使用方法如下：
+
+```java
+RemovalListener<String, Object> listener = notification ->
+        System.out.println("Key=" + notification.getValue() + ",Value=" + notification.getValue()
+        + " is removed! cause is " + notification.getCause().name());
+RemovalListener<String, Object> asyncListener = RemovalListeners.asynchronous(listener,
+        Executors.newSingleThreadExecutor());
+Cache<String, Object> cache = CacheBuilder.newBuilder()
+        .maximumSize(5)
+        .expireAfterWrite(3, TimeUnit.SECONDS)
+        .weakValues()
+        .removalListener(asyncListener)
+        .build();
 ```
 
 移除原因枚举类如下：
@@ -638,12 +706,200 @@ public enum RemovalCause {
 }
 ```
 
+实验代码：
+
+```java
+public static void main(String[] args) {
+    RemovalListener<String, Object> listener = notification ->
+        System.out.println("Key=" + notification.getValue() + ",Value=" + notification.getValue()
+                           + " is removed! cause is " + notification.getCause().name());
+    Cache<String, Object> cache = CacheBuilder.newBuilder()
+        .maximumSize(5)
+        .expireAfterWrite(3, TimeUnit.SECONDS)
+        .weakValues()
+        .removalListener(listener)
+        .build();
+    cache.put("hello1", "world1");
+    cache.put("hello2", "world2");
+    cache.put("hello3", "world3");
+    cache.put("hello4", "world4");
+    cache.put("hello5", "world5");
+    // 显示删除
+    cache.invalidate("hello1");
+    // 覆盖
+    cache.put("hello2", "new world");
+    try {
+        Thread.sleep(5000);
+    } catch (InterruptedException e) {
+        e.printStackTrace();
+    }
+}
+```
+
+运行结果如下：
+
+![image-20200623162835458](Guava的使用.assets/image-20200623162835458.png)
+
+此时我们发现并没有执行过期的条目清除的监听器执行逻辑。说明过期条目的移除并不是及时清除的。既然不是及时清除，那么可能是在读取时或写入时才去执行清除操作，在上面代码最后加上
+
+```java
+System.out.println("Put new entry...");
+cache.put("hello6", "world6");
+```
+
+再次运行，执行结果如下：
+
+![image-20200623162749148](Guava的使用.assets/image-20200623162749148.png)
 
 
-## 并发listenableFutrue回调
+
+### 源码分析
+
+源码层面分析我们主要关注Guava Cache的键值对过期清除的机制。因为键值对的过期会执行对应移除监听器的onRemoval方法，所以我们可以从RemovalListener的onRemoval方法切入开始追溯它什么时候进行键值对的清除。
+
+查找RemovalListener的onRemoval方法的使用，在LocalCache类中只有一个方法processPendingNotifications调用到onRemoval方法：
+
+```java
+/**
+ * Notifies listeners that an entry has been automatically removed due to expiration, eviction, or
+ * eligibility for garbage collection. This should be called every time expireEntries or
+ * evictEntry is called (once the lock is released).
+ * 该方法从监听器队列removalNotificationQueue中持续拉取监听器并执行onRemoval方法
+ */
+void processPendingNotifications() {
+  RemovalNotification<K, V> notification;
+  while ((notification = removalNotificationQueue.poll()) != null) {
+    try {
+      removalListener.onRemoval(notification);
+    } catch (Throwable e) {
+      logger.log(Level.WARNING, "Exception thrown by removal listener", e);
+    }
+  }
+}
+```
+
+processPendingNotifications()方法在下面方法中使用到：
+
+```java
+/**
+ * 执行读取后的例行清理。通常在写入期间进行清理。如果在足够的读取次数后未观察到清除，尝试从读取线程中清除.
+ */
+void postReadCleanup() {
+    if ((readCount.incrementAndGet() & DRAIN_THRESHOLD) == 0) {
+        cleanUp();
+    }
+}
+
+/**
+ * Performs routine cleanup prior to executing a write. This should be called every time a write
+ * thread acquires the segment lock, immediately after acquiring the lock.
+ *
+ * <p>Post-condition: expireEntries has been run.
+ */
+@GuardedBy("this")
+void preWriteCleanup(long now) {
+    runLockedCleanup(now);
+}
+
+void runUnlockedCleanup() {
+  // locked cleanup may generate notifications we can send unlocked
+  if (!isHeldByCurrentThread()) {
+    map.processPendingNotifications();
+  }
+}
+
+/** 写入后执行常规清除操作. */
+void postWriteCleanup() {
+    runUnlockedCleanup();
+}
+
+void cleanUp() {
+    long now = map.ticker.read();
+    runLockedCleanup(now);
+    runUnlockedCleanup();
+}
+```
+
+我们看到有postReadCleanup和postWriteCleanup两个方法，分别是在读取后和写入后进行清理操作。
 
 
 
+## ListenableFuture回调
+
+ListenableFuture是Guava提供的Future功能的扩展，支持回调功能，在Java的Future类是没有的。Java8的ComletableFuture参考ListenableFuture的思想也提供了回调功能，大家可以去学习下。
+
+- ListenableFuture继承了Future，额外新增了一个方法，listener是任务结束后的回调方法，executor是执行回调方法的执行器(通常是线程池)。guava中对future的增强就是在addListener这个方法上进行了各种各样的封装，所以addListener是核心方法
+
+```java
+void addListener(Runnable listener, Executor executor);
+```
+
+MoreExecutors.listeningDecorator就是包装了一下ThreadPoolExecutor，目的是为了使用ListenableFuture
+
+使用方法如下：
+
+```java
+public static void main(String[] args) throws ExecutionException, InterruptedException {
+    testListenableFuture();
+}
+public static void testListenableFuture() {
+    System.out.println("Main thread start..");
+    
+    ListeningExecutorService pool = MoreExecutors.listeningDecorator(Executors.newFixedThreadPool(5));
+    PassthroughTask task1 = new PassthroughTask("dev1");
+    PassthroughTask task2 = new PassthroughTask("dev2");
+    ListenableFuture<String> future1 = pool.submit(task1);
+    ListenableFuture<String> future2 = pool.submit(task2);
+
+    // addListener方法不能获取到异步任务的返回值。使用pool进行异步回调
+    future1.addListener(() -> System.out.println("execute addListener method"), pool);
+
+    /**
+     * FutureCallBack接口可以对每个任务的成功或失败单独做出响应
+     * onSuccess方法的入参就是任务的返回值
+     */
+    FutureCallback<String> callback = new FutureCallback<String>() {
+        @Override
+        public void onSuccess(@Nullable String result) {
+            System.out.println("result is " + result);
+        }
+
+        @Override
+        public void onFailure(Throwable t) {
+            t.printStackTrace();
+            System.out.println("occur error: " + t.getMessage());
+        }
+    };
+    // 绑定FutureCallback到异步任务，使用pool进行异步回调
+    Futures.addCallback(future2, callback, pool);
+
+    System.out.println("Main thread end..");
+}
+
+/**
+ * 透传设备任务
+ */
+class PassthroughTask implements Callable<String> {
+    private final String devId;
+
+    public PassthroughTask(String devId) {
+        this.devId = devId;
+    }
+
+    @Override
+    public String call() throws Exception {
+        System.out.println("start passthrough device: " + devId);
+        TimeUnit.SECONDS.sleep(1);
+        System.out.println("finish passthrough device: " + devId);
+        return devId + ":result";
+    }
+}
+```
+
+运行结果：
+
+![image-20200624174307656](Guava的使用.assets/image-20200624174307656.png)
 
 
-## 重试机制
+
+## guava-retrying重试机制
