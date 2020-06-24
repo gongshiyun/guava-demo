@@ -903,3 +903,46 @@ class PassthroughTask implements Callable<String> {
 
 
 ## guava-retrying重试机制
+
+```java
+public static void main(String[] args) {
+    Retryer<Boolean> deviceCfgSender = RetryerBuilder.<Boolean>newBuilder()
+            // 异常重试
+            .retryIfException()
+            // 当结果为true时重试
+            .retryIfResult(aBoolean -> Objects.equals(aBoolean, false))
+            // 等待策略：等待3秒后重试
+            .withWaitStrategy(WaitStrategies.fixedWait(3, TimeUnit.SECONDS))
+            // 停止策略：重试5次后停止重试
+            .withStopStrategy(StopStrategies.stopAfterAttempt(5))
+            // 重试监听器,重试后触发
+            .withRetryListener(new RetryListener() {
+                @Override
+                public <V> void onRetry(Attempt<V> attempt) {
+                    try {
+                        System.out.println(attempt.get());
+                    } catch (ExecutionException e) {
+                        e.printStackTrace();
+                    }
+                    System.out.println("Retry " + attempt.getAttemptNumber() + " times");
+                }
+            })
+            .build();
+    try {
+        deviceCfgSender.call(() -> {
+           System.out.println("send config to device failed.");
+           return false;
+        });
+    } catch (ExecutionException e) {
+        e.printStackTrace();
+        System.out.println("send config to device execute retry error.");
+    } catch (RetryException e) {
+        e.printStackTrace();
+        System.out.println("send config to device failed, stop retry.");
+    }
+}
+```
+
+运行结果：
+
+![image-20200624204249257](Guava的使用.assets/image-20200624204249257.png)
